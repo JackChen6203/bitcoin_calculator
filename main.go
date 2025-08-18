@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -36,8 +38,31 @@ type KeyRange struct {
 
 // Config holds application configuration
 type Config struct {
-	dbpool   *pgxpool.Pool
-	workerID string
+	dbpool       *pgxpool.Pool
+	workerID     string
+	discordWebhook string
+}
+
+// DiscordWebhookPayload represents the payload structure for Discord webhook
+type DiscordWebhookPayload struct {
+	Content string `json:"content"`
+	Embeds  []DiscordEmbed `json:"embeds,omitempty"`
+}
+
+// DiscordEmbed represents an embed in Discord message
+type DiscordEmbed struct {
+	Title       string              `json:"title"`
+	Description string              `json:"description"`
+	Color       int                 `json:"color"`
+	Fields      []DiscordEmbedField `json:"fields,omitempty"`
+	Timestamp   string              `json:"timestamp"`
+}
+
+// DiscordEmbedField represents a field in Discord embed
+type DiscordEmbedField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
 }
 
 func main() {
@@ -51,6 +76,14 @@ func main() {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL environment variable is not set")
+	}
+
+	// Get Discord webhook URL from environment (optional)
+	discordWebhook := os.Getenv("DISCORD_WEBHOOK_URL")
+	if discordWebhook == "" {
+		log.Println("DISCORD_WEBHOOK_URL not set, Discord notifications disabled")
+	} else {
+		log.Println("Discord notifications enabled")
 	}
 
 	// Create a context that we can cancel
@@ -67,8 +100,9 @@ func main() {
 	// Generate a unique ID for this worker
 	hostname, _ := os.Hostname()
 	appConfig := &Config{
-		dbpool:   dbpool,
-		workerID: fmt.Sprintf("%s%s-%d", workerID, hostname, time.Now().UnixNano()),
+		dbpool:        dbpool,
+		workerID:      fmt.Sprintf("%s%s-%d", workerID, hostname, time.Now().UnixNano()),
+		discordWebhook: discordWebhook,
 	}
 	log.Printf("Starting worker: %s", appConfig.workerID)
 
@@ -226,7 +260,7 @@ func checkPrivateKey(pKeyInt *big.Int) (string, *btcec.PrivateKey, error) {
 
 	// Manually create compressed public key bytes
 	var compressedPubKeyBytes []byte
-	if (*big.Int)(pubKey.Y).Bit(0) == 0 { // Y is even
+	if pubKey.Y().Bit(0) == 0 { // Y is even
 		compressedPubKeyBytes = make([]byte, 33)
 		compressedPubKeyBytes[0] = 0x02
 	} else { // Y is odd
@@ -234,7 +268,7 @@ func checkPrivateKey(pKeyInt *big.Int) (string, *btcec.PrivateKey, error) {
 		compressedPubKeyBytes[0] = 0x03
 	}
 	// Ensure X coordinate is 32 bytes long
-	xBytes := (*big.Int)(pubKey.X).Bytes()
+	xBytes := pubKey.X().Bytes()
 	copy(compressedPubKeyBytes[1+32-len(xBytes):], xBytes)
 
 	// Use btcutil.NewAddressPubKey to create the address from the compressed public key
@@ -306,6 +340,10 @@ func saveFoundWallet(ctx context.Context, config *Config, privKey *btcec.Private
 		log.Printf("Failed to save found wallet to database: %v", err)
 	} else {
 		log.Printf("Successfully saved wallet %s to database.", address)
+		// Send Discord notification if webhook is configured
+		if config.discordWebhook != "" {
+			go sendDiscordNotification(ctx, config.discordWebhook, address, balance, wif.String())
+		}
 	}
 }
 
@@ -318,4 +356,78 @@ func markWorkUnitComplete(ctx context.Context, config *Config, rangeID int64) er
     `
 	_, err := config.dbpool.Exec(ctx, query, rangeID)
 	return err
+}
+
+// sendDiscordNotification sends a notification to Discord webhook when a wallet with balance is found
+func sendDiscordNotification(ctx context.Context, webhookURL, address string, balance int64, privateKey string) {
+	// Convert satoshis to BTC for better readability
+	btcAmount := float64(balance) / 100000000.0
+
+	// Create embed with wallet information
+	embed := DiscordEmbed{
+		Title:       "🎯 發現有餘額的比特幣錢包！",
+		Description: "自動掃描系統發現了一個有餘額的比特幣地址",
+		Color:       0x00FF00, // Green color
+		Timestamp:   time.Now().Format(time.RFC3339),
+		Fields: []DiscordEmbedField{
+			{
+				Name:   "💰 地址",
+				Value:  fmt.Sprintf("`%s`", address),
+				Inline: false,
+			},
+			{
+				Name:   "💎 餘額",
+				Value:  fmt.Sprintf("**%.8f BTC** (%d satoshis)", btcAmount, balance),
+				Inline: true,
+			},
+			{
+				Name:   "🔑 私鑰 (WIF)",
+				Value:  fmt.Sprintf("||​`%s`​||", privateKey), // Spoiler tags for security
+				Inline: false,
+			},
+			{
+				Name:   "⏰ 發現時間",
+				Value:  fmt.Sprintf("<t:%d:F>", time.Now().Unix()),
+				Inline: true,
+			},
+		},
+	}
+
+	// Create payload
+	payload := DiscordWebhookPayload{
+		Content: fmt.Sprintf("🚨 **發現有餘額的錢包！** 🚨\n地址: %s\n餘額: %.8f BTC\n私鑰: ||%s||", address, btcAmount, privateKey),
+		Embeds:  []DiscordEmbed{embed},
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal Discord payload: %v", err)
+		return
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to create Discord webhook request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send request with timeout
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to send Discord notification: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("✅ Discord notification sent successfully for wallet: %s", address)
+	} else {
+		body, _ := ioutil.ReadAll(resp.Body)
+		log.Printf("❌ Discord notification failed. Status: %d, Response: %s", resp.StatusCode, string(body))
+	}
 }
