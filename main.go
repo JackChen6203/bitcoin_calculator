@@ -109,6 +109,9 @@ func main() {
 	}
 	log.Printf("Starting worker: %s", appConfig.workerID)
 
+	// Start HTTP health check server for Digital Ocean
+	go startHealthServer(ctx, appConfig)
+
 	// Handle graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -432,5 +435,97 @@ func sendDiscordNotification(ctx context.Context, webhookURL, address string, ba
 	} else {
 		body, _ := ioutil.ReadAll(resp.Body)
 		log.Printf("❌ Discord notification failed. Status: %d, Response: %s", resp.StatusCode, string(body))
+	}
+}
+
+// startHealthServer starts a simple HTTP server for health checks
+// Digital Ocean App Platform requires HTTP endpoints for health checks
+func startHealthServer(ctx context.Context, config *Config) {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default port for Digital Ocean
+	}
+
+	mux := http.NewServeMux()
+	
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Check database connection
+		err := config.dbpool.Ping(ctx)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"unhealthy","error":"%s"}`, err.Error())
+			return
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"healthy","worker_id":"%s","timestamp":"%s"}`, 
+			config.workerID, time.Now().Format(time.RFC3339))
+	})
+
+	// Status endpoint for monitoring
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{
+		"service": "Bitcoin Private Key Scanner",
+		"worker_id": "%s",
+		"status": "running",
+		"timestamp": "%s",
+		"discord_enabled": %t
+	}`, config.workerID, time.Now().Format(time.RFC3339), config.discordWebhook != "")
+	})
+
+	// Root endpoint
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+	<title>Bitcoin Scanner</title>
+	<style>body{font-family:Arial,sans-serif;margin:40px;}</style>
+</head>
+<body>
+	<h1>🎯 Bitcoin Private Key Scanner</h1>
+	<p><strong>Status:</strong> Running</p>
+	<p><strong>Worker ID:</strong> %s</p>
+	<p><strong>Discord Notifications:</strong> %s</p>
+	<p><strong>Timestamp:</strong> %s</p>
+	<hr>
+	<h3>Endpoints:</h3>
+	<ul>
+		<li><a href="/health">/health</a> - Health check</li>
+		<li><a href="/status">/status</a> - Service status</li>
+	</ul>
+</body>
+</html>`, config.workerID, 
+			map[bool]string{true: "✅ Enabled", false: "❌ Disabled"}[config.discordWebhook != ""],
+			time.Now().Format(time.RFC3339))
+	})
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	log.Printf("Starting health server on port %s", port)
+	
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Health server error: %v", err)
+		}
+	}()
+
+	// Graceful shutdown when context is cancelled
+	<-ctx.Done()
+	log.Println("Shutting down health server...")
+	
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Health server shutdown error: %v", err)
 	}
 }
