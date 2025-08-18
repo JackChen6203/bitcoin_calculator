@@ -1,3 +1,6 @@
+//go:build populate
+// +build populate
+
 package main
 
 import (

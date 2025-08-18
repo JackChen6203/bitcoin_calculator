@@ -88,13 +88,15 @@ CREATE INDEX idx_found_wallets_address ON found_wallets(address);
 
 ### 1. 初始化工作範圍
 ```bash
-go build -o populate_ranges populate_ranges.go
+# 構建 populate 工具
+go build -tags populate -o populate_ranges .
 ./populate_ranges
 ```
 
 ### 2. 啟動掃描器
 ```bash
-go build -o bitcoin_scanner main.go
+# 構建掃描器（默認）
+go build -o bitcoin_scanner .
 ./bitcoin_scanner
 ```
 
