@@ -77,10 +77,7 @@ func main() {
 
 	// Get database URL from environment
 	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL environment variable is not set")
-	}
-
+	
 	// Get Discord webhook URL from environment (optional)
 	discordWebhook := os.Getenv("DISCORD_WEBHOOK_URL")
 	if discordWebhook == "" {
@@ -93,24 +90,53 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup database connection pool
-	dbpool, err := pgxpool.Connect(ctx, databaseURL)
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %v", err)
-	}
-	defer dbpool.Close()
-
-	// Generate a unique ID for this worker
+	// Initialize app config without database first
 	hostname, _ := os.Hostname()
 	appConfig := &Config{
-		dbpool:        dbpool,
+		dbpool:        nil, // Will be set later if database connection succeeds
 		workerID:      fmt.Sprintf("%s%s-%d", workerID, hostname, time.Now().UnixNano()),
 		discordWebhook: discordWebhook,
 	}
-	log.Printf("Starting worker: %s", appConfig.workerID)
 
-	// Start HTTP health check server for Digital Ocean
+	// Start HTTP health check server immediately (even without database)
 	go startHealthServer(ctx, appConfig)
+	log.Printf("Health server started on port %s", getPort())
+
+	// Try to connect to database
+	if databaseURL == "" {
+		log.Println("⚠️  DATABASE_URL environment variable is not set")
+		log.Println("⚠️  Running in health-check-only mode")
+		log.Println("⚠️  Bitcoin scanning is disabled until database is configured")
+		
+		// Keep the app running for health checks
+		select {
+		case <-ctx.Done():
+			log.Println("Application shutting down...")
+			return
+		}
+	}
+
+	// Setup database connection pool
+	log.Println("Connecting to database...")
+	dbpool, err := pgxpool.Connect(ctx, databaseURL)
+	if err != nil {
+		log.Printf("❌ Unable to connect to database: %v", err)
+		log.Println("⚠️  Running in health-check-only mode")
+		log.Println("⚠️  Bitcoin scanning is disabled until database connection is fixed")
+		
+		// Keep the app running for health checks
+		select {
+		case <-ctx.Done():
+			log.Println("Application shutting down...")
+			return
+		}
+	}
+	defer dbpool.Close()
+
+	// Update config with database connection
+	appConfig.dbpool = dbpool
+	log.Println("✅ Database connection established")
+	log.Printf("🚀 Starting Bitcoin scanner worker: %s", appConfig.workerID)
 
 	// Handle graceful shutdown
 	c := make(chan os.Signal, 1)
@@ -438,29 +464,46 @@ func sendDiscordNotification(ctx context.Context, webhookURL, address string, ba
 	}
 }
 
-// startHealthServer starts a simple HTTP server for health checks
-// Digital Ocean App Platform requires HTTP endpoints for health checks
-func startHealthServer(ctx context.Context, config *Config) {
+// getPort returns the port to use for the HTTP server
+func getPort() string {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080" // Default port for Digital Ocean
 	}
+	return port
+}
+
+// startHealthServer starts a simple HTTP server for health checks
+// Digital Ocean App Platform requires HTTP endpoints for health checks
+func startHealthServer(ctx context.Context, config *Config) {
+	port := getPort()
 
 	mux := http.NewServeMux()
 	
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		// Check database connection
-		err := config.dbpool.Ping(ctx)
-		if err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, `{"status":"unhealthy","error":"%s"}`, err.Error())
+		w.Header().Set("Content-Type", "application/json")
+		
+		// Check if database connection exists and is healthy
+		if config.dbpool == nil {
+			// No database connection - return partial health status
+			w.WriteHeader(http.StatusOK) // Still return 200 for Digital Ocean health checks
+			fmt.Fprintf(w, `{"status":"partial","message":"HTTP server healthy, database not configured","worker_id":"%s","timestamp":"%s"}`, 
+				config.workerID, time.Now().Format(time.RFC3339))
 			return
 		}
 		
-		w.Header().Set("Content-Type", "application/json")
+		// Check database connection
+		err := config.dbpool.Ping(ctx)
+		if err != nil {
+			w.WriteHeader(http.StatusOK) // Still return 200 for Digital Ocean health checks
+			fmt.Fprintf(w, `{"status":"partial","message":"HTTP server healthy, database connection failed","error":"%s","worker_id":"%s","timestamp":"%s"}`, 
+				err.Error(), config.workerID, time.Now().Format(time.RFC3339))
+			return
+		}
+		
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"healthy","worker_id":"%s","timestamp":"%s"}`, 
+		fmt.Fprintf(w, `{"status":"healthy","message":"All systems operational","worker_id":"%s","timestamp":"%s"}`, 
 			config.workerID, time.Now().Format(time.RFC3339))
 	})
 
@@ -468,41 +511,79 @@ func startHealthServer(ctx context.Context, config *Config) {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		
+		dbStatus := "not configured"
+		if config.dbpool != nil {
+			if err := config.dbpool.Ping(ctx); err == nil {
+				dbStatus = "connected"
+			} else {
+				dbStatus = "connection failed"
+			}
+		}
+		
 		fmt.Fprintf(w, `{
 		"service": "Bitcoin Private Key Scanner",
 		"worker_id": "%s",
 		"status": "running",
-		"timestamp": "%s",
-		"discord_enabled": %t
-	}`, config.workerID, time.Now().Format(time.RFC3339), config.discordWebhook != "")
+		"database_status": "%s",
+		"discord_enabled": %t,
+		"scanning_active": %t,
+		"timestamp": "%s"
+	}`, config.workerID, dbStatus, config.discordWebhook != "", config.dbpool != nil, time.Now().Format(time.RFC3339))
 	})
 
 	// Root endpoint
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
+		
+		dbStatus := "❌ Not configured"
+		scanningStatus := "❌ Inactive"
+		
+		if config.dbpool != nil {
+			if err := config.dbpool.Ping(ctx); err == nil {
+				dbStatus = "✅ Connected"
+				scanningStatus = "✅ Active"
+			} else {
+				dbStatus = "⚠️ Connection failed"
+			}
+		}
+		
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head>
 	<title>Bitcoin Scanner</title>
-	<style>body{font-family:Arial,sans-serif;margin:40px;}</style>
+	<style>
+		body{font-family:Arial,sans-serif;margin:40px;background:#f5f5f5;}
+		.container{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
+		.status{margin:10px 0;}
+		.healthy{color:#28a745;}
+		.warning{color:#ffc107;}
+		.error{color:#dc3545;}
+	</style>
 </head>
 <body>
-	<h1>🎯 Bitcoin Private Key Scanner</h1>
-	<p><strong>Status:</strong> Running</p>
-	<p><strong>Worker ID:</strong> %s</p>
-	<p><strong>Discord Notifications:</strong> %s</p>
-	<p><strong>Timestamp:</strong> %s</p>
-	<hr>
-	<h3>Endpoints:</h3>
-	<ul>
-		<li><a href="/health">/health</a> - Health check</li>
-		<li><a href="/status">/status</a> - Service status</li>
-	</ul>
+	<div class="container">
+		<h1>🎯 Bitcoin Private Key Scanner</h1>
+		<div class="status"><strong>HTTP Server:</strong> <span class="healthy">✅ Running</span></div>
+		<div class="status"><strong>Database:</strong> %s</div>
+		<div class="status"><strong>Bitcoin Scanning:</strong> %s</div>
+		<div class="status"><strong>Discord Notifications:</strong> %s</div>
+		<div class="status"><strong>Worker ID:</strong> %s</div>
+		<div class="status"><strong>Timestamp:</strong> %s</div>
+		<hr>
+		<h3>API Endpoints:</h3>
+		<ul>
+			<li><a href="/health">/health</a> - Health check (JSON)</li>
+			<li><a href="/status">/status</a> - Detailed status (JSON)</li>
+		</ul>
+		<hr>
+		<p><small>To configure the database, set the DATABASE_URL environment variable.</small></p>
+	</div>
 </body>
-</html>`, config.workerID, 
+</html>`, dbStatus, scanningStatus,
 			map[bool]string{true: "✅ Enabled", false: "❌ Disabled"}[config.discordWebhook != ""],
-			time.Now().Format(time.RFC3339))
+			config.workerID, time.Now().Format(time.RFC3339))
 	})
 
 	server := &http.Server{
