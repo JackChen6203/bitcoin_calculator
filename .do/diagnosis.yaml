@@ -1,0 +1,40 @@
+# Digital Ocean App Platform 配置檔案
+# 專門用於部署 Supabase 連線診斷工具
+
+name: bitcoin-calculator-diagnosis
+services:
+- name: diagnosis-service
+  source_dir: /
+  github:
+    repo: your-username/bitcoin_calculator  # 請替換為你的 GitHub 倉庫
+    branch: main
+  run_command: ./diagnose_connection
+  environment_slug: go
+  instance_count: 1
+  instance_size_slug: basic-xxs  # 最小規格，診斷工具不需要太多資源
+  http_port: 8080
+  dockerfile_path: Dockerfile.diagnosis
+  
+  # 健康檢查
+  health_check:
+    http_path: /health
+    initial_delay_seconds: 10
+    period_seconds: 30
+    timeout_seconds: 5
+    success_threshold: 1
+    failure_threshold: 3
+
+  # 環境變數（與主應用程式相同）
+  envs:
+  - key: PORT
+    scope: RUN_TIME
+    value: "8080"
+  - key: DATABASE_URL
+    scope: RUN_TIME
+    value: "${DATABASE_URL}"  # 從主應用程式繼承
+  - key: DISCORD_WEBHOOK_URL
+    scope: RUN_TIME
+    value: "${DISCORD_WEBHOOK_URL}"  # 可選
+
+# 注意：這個配置檔案用於獨立部署診斷工具
+# 如果你想在現有應用程式中運行診斷，請直接使用 diagnose_connection.go

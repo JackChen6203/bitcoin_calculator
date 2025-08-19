@@ -635,7 +635,11 @@ func performDatabaseDiagnostics(ctx context.Context, dbpool *pgxpool.Pool) {
 	if err != nil {
 		log.Printf("❌ Failed to get version: %v", err)
 	} else {
-		log.Printf("✅ Database version: %s", version[:100] + "...") // Truncate for readability
+		if len(version) > 100 {
+			log.Printf("✅ Database version: %s", version[:100] + "...")
+		} else {
+			log.Printf("✅ Database version: %s", version)
+		}
 	}
 	
 	// Test 3: Check current database and schema

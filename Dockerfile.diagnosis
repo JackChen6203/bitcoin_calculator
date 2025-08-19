@@ -1,0 +1,53 @@
+# Supabase 連線診斷工具 Dockerfile
+# 專為 Digital Ocean App Platform 設計
+
+FROM golang:1.21-alpine AS builder
+
+# 安裝必要工具
+RUN apk add --no-cache git ca-certificates tzdata
+
+# 設定工作目錄
+WORKDIR /app
+
+# 複製 go.mod 和 go.sum
+COPY go.mod go.sum ./
+
+# 下載依賴
+RUN go mod download
+
+# 複製診斷工具源碼
+COPY diagnose_connection.go .
+
+# 編譯診斷工具
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o diagnose_connection .
+
+# 運行階段
+FROM alpine:latest
+
+# 安裝 CA 證書（SSL 連線需要）
+RUN apk --no-cache add ca-certificates tzdata
+
+# 創建非 root 使用者
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+WORKDIR /app
+
+# 從建置階段複製二進位檔案
+COPY --from=builder /app/diagnose_connection .
+
+# 設定檔案權限
+RUN chown -R appuser:appgroup /app
+
+# 切換到非 root 使用者
+USER appuser
+
+# 暴露埠（雖然診斷工具不需要，但保持一致性）
+EXPOSE 8080
+
+# 健康檢查（檢查二進位檔案是否存在）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD test -f /app/diagnose_connection || exit 1
+
+# 執行診斷工具
+CMD ["./diagnose_connection"]
