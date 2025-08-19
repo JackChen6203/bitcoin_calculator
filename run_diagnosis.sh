@@ -13,15 +13,15 @@ if ! command -v go &> /dev/null; then
 fi
 
 # 檢查診斷工具是否存在
-if [ ! -f "diagnose_connection.go" ]; then
-    echo "❌ 找不到 diagnose_connection.go 檔案"
+if [ ! -f "cmd/diagnose/main.go" ]; then
+    echo "❌ 找不到 cmd/diagnose/main.go 檔案"
     exit 1
 fi
 
 # 執行診斷
 echo "🚀 執行診斷工具..."
 echo ""
-go run diagnose_connection.go
+go run cmd/diagnose/main.go
 
 # 檢查執行結果
 if [ $? -eq 0 ]; then

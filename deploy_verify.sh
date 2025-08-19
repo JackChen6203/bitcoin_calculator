@@ -29,8 +29,8 @@ echo ""
 
 # 執行快速連線檢查
 echo "🔗 執行 Supabase 連線檢查..."
-if [ -f "quick_check.go" ]; then
-    go run quick_check.go
+if [ -f "cmd/quick-check/main.go" ]; then
+    go run cmd/quick-check/main.go
     if [ $? -eq 0 ]; then
         echo "✅ Supabase 連線檢查通過"
     else
@@ -38,7 +38,7 @@ if [ -f "quick_check.go" ]; then
         exit 1
     fi
 else
-    echo "⚠️ 找不到 quick_check.go，跳過連線檢查"
+    echo "⚠️ 找不到 cmd/quick-check/main.go，跳過連線檢查"
 fi
 
 echo ""
