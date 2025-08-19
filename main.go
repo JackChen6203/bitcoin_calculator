@@ -136,6 +136,10 @@ func main() {
 	// Update config with database connection
 	appConfig.dbpool = dbpool
 	log.Println("✅ Database connection established")
+	
+	// Add detailed database diagnostics
+	performDatabaseDiagnostics(ctx, dbpool)
+	
 	log.Printf("🚀 Starting Bitcoin scanner worker: %s", appConfig.workerID)
 
 	// Handle graceful shutdown
@@ -609,4 +613,183 @@ func startHealthServer(ctx context.Context, config *Config) {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Health server shutdown error: %v", err)
 	}
+}
+
+// performDatabaseDiagnostics performs detailed database diagnostics
+func performDatabaseDiagnostics(ctx context.Context, dbpool *pgxpool.Pool) {
+	log.Println("🔍 Starting database diagnostics...")
+	
+	// Test 1: Basic connection test
+	log.Println("🔍 Test 1: Basic connection ping")
+	err := dbpool.Ping(ctx)
+	if err != nil {
+		log.Printf("❌ Ping failed: %v", err)
+		return
+	}
+	log.Println("✅ Ping successful")
+	
+	// Test 2: Get database version and basic info
+	log.Println("🔍 Test 2: Database version and info")
+	var version string
+	err = dbpool.QueryRow(ctx, "SELECT version()").Scan(&version)
+	if err != nil {
+		log.Printf("❌ Failed to get version: %v", err)
+	} else {
+		log.Printf("✅ Database version: %s", version[:100] + "...") // Truncate for readability
+	}
+	
+	// Test 3: Check current database and schema
+	log.Println("🔍 Test 3: Current database and schema")
+	var currentDB, currentSchema, currentUser string
+	err = dbpool.QueryRow(ctx, "SELECT current_database(), current_schema(), current_user").Scan(&currentDB, &currentSchema, &currentUser)
+	if err != nil {
+		log.Printf("❌ Failed to get database info: %v", err)
+	} else {
+		log.Printf("✅ Current database: %s", currentDB)
+		log.Printf("✅ Current schema: %s", currentSchema)
+		log.Printf("✅ Current user: %s", currentUser)
+	}
+	
+	// Test 4: List all tables in current schema
+	log.Println("🔍 Test 4: Listing all tables in current schema")
+	rows, err := dbpool.Query(ctx, `
+		SELECT table_name, table_type 
+		FROM information_schema.tables 
+		WHERE table_schema = current_schema() 
+		ORDER BY table_name
+	`)
+	if err != nil {
+		log.Printf("❌ Failed to list tables: %v", err)
+	} else {
+		var tableCount int
+		log.Println("✅ Tables in current schema:")
+		for rows.Next() {
+			var tableName, tableType string
+			err = rows.Scan(&tableName, &tableType)
+			if err != nil {
+				log.Printf("  ❌ Error scanning table: %v", err)
+				continue
+			}
+			log.Printf("  - %s (%s)", tableName, tableType)
+			tableCount++
+		}
+		rows.Close()
+		log.Printf("✅ Total tables found: %d", tableCount)
+	}
+	
+	// Test 5: Check if key_ranges table exists specifically
+	log.Println("🔍 Test 5: Checking for key_ranges table specifically")
+	var exists bool
+	err = dbpool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_schema = current_schema() 
+			AND table_name = 'key_ranges'
+		)
+	`).Scan(&exists)
+	if err != nil {
+		log.Printf("❌ Failed to check key_ranges existence: %v", err)
+	} else if exists {
+		log.Println("✅ key_ranges table EXISTS")
+		
+		// Test 5a: Check table structure
+		log.Println("🔍 Test 5a: key_ranges table structure")
+		colRows, err := dbpool.Query(ctx, `
+			SELECT column_name, data_type, is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema = current_schema() 
+			AND table_name = 'key_ranges'
+			ORDER BY ordinal_position
+		`)
+		if err != nil {
+			log.Printf("❌ Failed to get column info: %v", err)
+		} else {
+			log.Println("✅ key_ranges columns:")
+			for colRows.Next() {
+				var colName, dataType, nullable, defaultVal string
+				err = colRows.Scan(&colName, &dataType, &nullable, &defaultVal)
+				if err != nil {
+					log.Printf("  ❌ Error scanning column: %v", err)
+					continue
+				}
+				log.Printf("  - %s: %s (nullable: %s, default: %s)", colName, dataType, nullable, defaultVal)
+			}
+			colRows.Close()
+		}
+		
+		// Test 5b: Count rows in key_ranges
+		var rowCount int
+		err = dbpool.QueryRow(ctx, "SELECT COUNT(*) FROM key_ranges").Scan(&rowCount)
+		if err != nil {
+			log.Printf("❌ Failed to count key_ranges rows: %v", err)
+		} else {
+			log.Printf("✅ key_ranges contains %d rows", rowCount)
+			
+			// Test 5c: Show status distribution
+			if rowCount > 0 {
+				statusRows, err := dbpool.Query(ctx, "SELECT status, COUNT(*) FROM key_ranges GROUP BY status ORDER BY status")
+				if err != nil {
+					log.Printf("❌ Failed to get status distribution: %v", err)
+				} else {
+					log.Println("✅ Status distribution:")
+					for statusRows.Next() {
+						var status string
+						var count int
+						err = statusRows.Scan(&status, &count)
+						if err != nil {
+							log.Printf("  ❌ Error scanning status: %v", err)
+							continue
+						}
+						log.Printf("  - %s: %d", status, count)
+					}
+					statusRows.Close()
+				}
+			}
+		}
+	} else {
+		log.Println("❌ key_ranges table does NOT exist")
+	}
+	
+	// Test 6: Check if found_wallets table exists
+	log.Println("🔍 Test 6: Checking for found_wallets table")
+	err = dbpool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_schema = current_schema() 
+			AND table_name = 'found_wallets'
+		)
+	`).Scan(&exists)
+	if err != nil {
+		log.Printf("❌ Failed to check found_wallets existence: %v", err)
+	} else if exists {
+		log.Println("✅ found_wallets table EXISTS")
+	} else {
+		log.Println("❌ found_wallets table does NOT exist")
+	}
+	
+	// Test 7: Test the exact query that's failing
+	log.Println("🔍 Test 7: Testing the exact claimWorkUnit query")
+	testQuery := `
+		UPDATE key_ranges
+		SET status = 'processing', worker_id = $1, claimed_at = NOW()
+		WHERE id = (
+			SELECT id
+			FROM key_ranges
+			WHERE status = 'pending'
+			ORDER BY id
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, start_key_hex, end_key_hex;
+	`
+	_, err = dbpool.Query(ctx, testQuery, "diagnostic-test-worker")
+	if err != nil {
+		log.Printf("❌ Exact claimWorkUnit query failed: %v", err)
+		log.Printf("❌ This is the same error the application is experiencing")
+	} else {
+		log.Println("✅ claimWorkUnit query executed successfully (no work units available or claimed)")
+	}
+	
+	log.Println("🔍 Database diagnostics completed")
+	log.Println("========================================")
 }
